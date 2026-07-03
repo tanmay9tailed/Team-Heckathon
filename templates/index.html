@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>SQL Data Quality Profiler</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div>
+          <h1>SQL Data Quality Profiler</h1>
+          <p id="connection-status">Checking SQL Server connection...</p>
+        </div>
+        <a id="export-link" class="button muted disabled" href="/api/export" aria-disabled="true">Export XLSX</a>
+      </header>
+
+      <main class="layout">
+        <section class="panel source-panel">
+          <div class="panel-header">
+            <h2>Schema Source</h2>
+            <span id="schema-count">No schema loaded</span>
+          </div>
+
+          <form id="upload-form" enctype="multipart/form-data">
+            <label for="schema-file">SQL file or diagram</label>
+            <input id="schema-file" type="file" name="file" accept=".sql,.txt,.json,.png,.jpg,.jpeg,.webp,.bmp" />
+            <button type="submit">Load File</button>
+          </form>
+
+          <div class="database-row">
+            <label for="database-select">Database</label>
+            <select id="database-select"></select>
+            <button id="discover-btn" class="secondary" type="button">Discover</button>
+          </div>
+
+          <div id="upload-status" class="status">Ready</div>
+          <div id="table-list" class="table-list"></div>
+        </section>
+
+        <section class="panel run-panel">
+          <div class="panel-header">
+            <h2>Execution</h2>
+            <span id="run-state">Idle</span>
+          </div>
+
+          <form id="profile-form">
+            <label for="message">Profiling focus</label>
+            <textarea id="message" rows="4">Run a full data quality profile for completeness, validity, uniqueness, consistency, referential integrity, schema conformance, temporal consistency, cross-table reconciliation, and business rule conformance.</textarea>
+            <button id="run-profile-btn" type="submit">Run Full Profile</button>
+          </form>
+
+          <div id="ai-note" class="note"></div>
+          <div id="warning-box" class="warning hidden"></div>
+        </section>
+      </main>
+
+      <section class="panel failed-panel">
+        <div class="panel-header">
+          <h2>Failed Checks</h2>
+          <span id="issue-count">0 failed</span>
+        </div>
+        <div id="failed-query-list" class="query-list">
+          <p class="empty-state">No profiling run yet.</p>
+        </div>
+      </section>
+
+      <section class="panel checks-panel">
+        <div class="panel-header">
+          <h2>Executed Checks</h2>
+          <span id="check-count">0 checks</span>
+        </div>
+        <div id="checks-list" class="checks-list"></div>
+      </section>
+    </div>
+
+    <script>
+      const uploadForm = document.getElementById('upload-form');
+      const profileForm = document.getElementById('profile-form');
+      const uploadStatus = document.getElementById('upload-status');
+      const discoverBtn = document.getElementById('discover-btn');
+      const databaseSelect = document.getElementById('database-select');
+      const connectionStatus = document.getElementById('connection-status');
+      const schemaCount = document.getElementById('schema-count');
+      const tableList = document.getElementById('table-list');
+      const runState = document.getElementById('run-state');
+      const aiNote = document.getElementById('ai-note');
+      const warningBox = document.getElementById('warning-box');
+      const exportLink = document.getElementById('export-link');
+      let latestReport = null;
+      let schemaLoaded = false;
+      let loadedDatabase = '';
+
+      function escapeHtml(value) {
+        return String(value ?? '')
+          .replaceAll('&', '&amp;')
+          .replaceAll('<', '&lt;')
+          .replaceAll('>', '&gt;')
+          .replaceAll('"', '&quot;')
+          .replaceAll("'", '&#039;');
+      }
+
+      async function fetchJson(url, options = {}) {
+        const response = await fetch(url, options);
+        const data = await response.json();
+        if (!response.ok || data.ok === false) {
+          throw new Error(data.error || 'Request failed.');
+        }
+        return data;
+      }
+
+      async function loadDatabases() {
+        try {
+          const result = await fetchJson('/api/databases');
+          databaseSelect.innerHTML = '';
+          result.databases.forEach((db) => {
+            const option = document.createElement('option');
+            option.value = db;
+            option.textContent = db;
+            databaseSelect.appendChild(option);
+          });
+          connectionStatus.textContent = result.databases.length
+            ? `${result.databases.length} databases available`
+            : 'No databases returned';
+          uploadStatus.textContent = result.databases.length ? 'Select a database or load a file.' : 'Load a SQL file or schema diagram.';
+        } catch (error) {
+          connectionStatus.textContent = 'SQL Server connection unavailable';
+          uploadStatus.textContent = error.message;
+        }
+      }
+
+      function renderSchema(result) {
+        const tables = result.tables || [];
+        schemaLoaded = tables.length > 0;
+        loadedDatabase = result.database || databaseSelect.value || '';
+        schemaCount.textContent = `${tables.length} tables, ${(result.relationships || []).length} relationships`;
+        tableList.innerHTML = tables.slice(0, 80).map((table) => `<span>${escapeHtml(table)}</span>`).join('');
+        if (result.database && databaseSelect.options.length) {
+          const match = Array.from(databaseSelect.options).find((option) => option.value === result.database);
+          if (match) databaseSelect.value = result.database;
+        }
+      }
+
+      async function discoverFromDatabase() {
+        const database = databaseSelect.value;
+        if (!database) return;
+        uploadStatus.textContent = `Discovering ${database}...`;
+        discoverBtn.disabled = true;
+        try {
+          const result = await fetchJson('/api/discover', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ database })
+          });
+          uploadStatus.textContent = result.message;
+          renderSchema(result);
+        } catch (error) {
+          uploadStatus.textContent = error.message;
+        } finally {
+          discoverBtn.disabled = false;
+        }
+      }
+
+      uploadForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const formData = new FormData(uploadForm);
+        uploadStatus.textContent = 'Loading file...';
+        try {
+          const result = await fetchJson('/api/upload', { method: 'POST', body: formData });
+          uploadStatus.textContent = result.message;
+          renderSchema(result);
+        } catch (error) {
+          uploadStatus.textContent = error.message;
+        }
+      });
+
+      discoverBtn.addEventListener('click', discoverFromDatabase);
+
+      document.addEventListener('click', (event) => {
+        const button = event.target.closest('[data-run-query]');
+        if (!button) return;
+        runSavedQuery(button);
+      });
+
+      profileForm.addEventListener('submit', async (event) => {
+        event.preventDefault();
+        const database = databaseSelect.value;
+        const message = document.getElementById('message').value.trim();
+        runState.textContent = 'Running';
+        warningBox.classList.add('hidden');
+        document.getElementById('run-profile-btn').disabled = true;
+        try {
+          const result = await fetchJson('/api/profile', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ database, message })
+          });
+          runState.textContent = 'Complete';
+          aiNote.textContent = result.reply || '';
+          if (result.gemini_error) {
+            warningBox.textContent = `Gemini note: ${result.gemini_error}`;
+            warningBox.classList.remove('hidden');
+          }
+          renderReport(result.report);
+          exportLink.classList.remove('disabled');
+          exportLink.removeAttribute('aria-disabled');
+        } catch (error) {
+          runState.textContent = 'Failed';
+          warningBox.textContent = error.message;
+          warningBox.classList.remove('hidden');
+        } finally {
+          document.getElementById('run-profile-btn').disabled = false;
+        }
+      });
+
+      function renderReport(report) {
+        latestReport = report;
+        document.getElementById('issue-count').textContent = `${report.issues.length} failed`;
+
+        const failedQueryList = document.getElementById('failed-query-list');
+        if (!report.issues.length) {
+          failedQueryList.innerHTML = '<p class="empty-state">No failed checks found.</p>';
+        } else {
+          failedQueryList.innerHTML = report.issues.map((issue, index) => `
+            <details>
+              <summary>
+                <span class="status-dot ${escapeHtml(issue.status)}"></span>
+                <span>${escapeHtml(issue.table)}</span>
+                <strong>${escapeHtml(issue.question)}</strong>
+                <em>${escapeHtml(issue.rows_returned)} rows</em>
+              </summary>
+              <div class="query-result">
+                <h3>Query</h3>
+                <pre>${escapeHtml(issue.result_sql || issue.sql || '')}</pre>
+                <div class="query-actions">
+                  <button type="button" data-run-query data-query-source="issues" data-query-index="${index}">Run Query</button>
+                  <span data-query-status></span>
+                </div>
+                <h3>Result Table</h3>
+                <div data-query-output>
+                  <p class="empty-state">Click Run Query to execute this query and show the SSMS-style result table.</p>
+                </div>
+              </div>
+            </details>
+          `).join('');
+        }
+
+        const checksList = document.getElementById('checks-list');
+        document.getElementById('check-count').textContent = `${report.checks.length} checks`;
+        checksList.innerHTML = report.checks.map((check, index) => `
+          <details>
+            <summary>
+              <span class="status-dot ${escapeHtml(check.status)}"></span>
+              <span>${escapeHtml(check.table)}</span>
+              <strong>${escapeHtml(check.question)}</strong>
+              <em>${escapeHtml(check.rows_returned)} rows</em>
+            </summary>
+            <div class="query-result">
+              <h3>Query</h3>
+              <pre>${escapeHtml(check.result_sql || check.sql)}</pre>
+              <div class="query-actions">
+                <button type="button" data-run-query data-query-source="checks" data-query-index="${index}">Run Query</button>
+                <span data-query-status></span>
+              </div>
+              <div data-query-output>
+                <p class="empty-state">Click Run Query to execute this check and show returned rows.</p>
+              </div>
+            </div>
+          </details>
+        `).join('');
+      }
+
+      async function runSavedQuery(button) {
+        if (!latestReport) return;
+        const source = button.dataset.querySource;
+        const index = Number(button.dataset.queryIndex);
+        const item = latestReport[source]?.[index];
+        const sql = item?.result_sql || item?.sql || '';
+        const status = button.parentElement.querySelector('[data-query-status]');
+        const output = button.closest('.query-result').querySelector('[data-query-output]');
+        const database = loadedDatabase || databaseSelect.value;
+        if (!schemaLoaded || !database) {
+          const message = 'Load a SQL file or discover a database before running queries.';
+          if (status) status.textContent = message;
+          if (output) output.innerHTML = `<p class="empty-state">${escapeHtml(message)}</p>`;
+          return;
+        }
+        if (!sql) {
+          if (status) status.textContent = 'No SQL found for this query.';
+          return;
+        }
+
+        button.disabled = true;
+        if (status) status.textContent = 'Running...';
+        try {
+          const response = await fetch('/api/query', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ database, sql })
+          });
+          const result = await response.json();
+          if (!response.ok || result.ok === false) {
+            throw new Error(result.error || result.execution?.error || 'Query failed.');
+          }
+          const execution = result.execution || {};
+          if (status) {
+            status.textContent = `${execution.row_count || 0} rows fetched in ${execution.execution_time_ms || 0} ms`;
+          }
+          if (output) {
+            output.innerHTML = renderRowsTable(execution.columns || [], execution.rows || []);
+          }
+        } catch (error) {
+          if (status) status.textContent = error.message;
+          if (output) output.innerHTML = `<p class="empty-state">${escapeHtml(error.message)}</p>`;
+        } finally {
+          button.disabled = false;
+        }
+      }
+
+      function renderRowsTable(columns, rows) {
+        if (!rows.length) {
+          return '<p class="empty-state">No row results were returned for this check.</p>';
+        }
+        const safeColumns = columns.length ? columns : rows[0].map((_, index) => `Column ${index + 1}`);
+        return `
+          <div class="table-wrap row-results">
+            <table>
+              <thead>
+                <tr>${safeColumns.map((column) => `<th>${escapeHtml(column)}</th>`).join('')}</tr>
+              </thead>
+              <tbody>
+                ${rows.map((row) => `
+                  <tr>${row.map((value) => `<td>${escapeHtml(value)}</td>`).join('')}</tr>
+                `).join('')}
+              </tbody>
+            </table>
+          </div>
+        `;
+      }
+
+      window.addEventListener('DOMContentLoaded', loadDatabases);
+    </script>
+  </body>
+</html>
